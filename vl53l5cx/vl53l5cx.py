@@ -4,8 +4,7 @@ from typing import List
 from .api import *
 from .buffers import Buffers
 
-
-DEBUG_IO = False
+DEBUG_INITIALIZATION = False
 DEBUG_LOW_LEVEL_LOGIC = False
 DEBUG_LOW_LEVEL_LOGIC_START_RANGING = False
 DEBUG_LOW_LEVEL_LOGIC_SEND_OFFSET_DATA = False
@@ -161,12 +160,12 @@ class VL53L5CXResultsData:
                 i += 1
                 ptr += 4
                 size -= 4
-
+    
 
 class VL53L5CX:
     def __init__(
             self,
-            i2c_bus=None,
+            i2c_bus="SMBUS2",
             bus_id: int = 1,
             use_raw_format: bool = False,
             nb_target_per_zone: int = 1,
@@ -302,11 +301,21 @@ class VL53L5CX:
         self.i2c_address = VL53L5CX_DEFAULT_I2C_ADDRESS
 
         if i2c_bus is None:
-            from smbus2 import SMBus, i2c_msg
-            self._i2c_bus = SMBus(bus_id)
-            self.i2c_msg = i2c_msg
+            from . _platform_smbus import I2CAPI
+            self.i2capi = I2CAPI(None, self.i2c_address)
         else:
-            self._i2c_bus = i2c_bus
+            try:
+                if i2c_bus.startswith("ftdi://"):
+                    from ._platform_ftdi import I2CAPI
+                    self.i2capi = I2CAPI(i2c_bus, self.i2c_address)
+                elif "SMBUS2" == i2c_bus:
+                    from ._platform_smbus import I2CAPI
+                    self.i2capi = I2CAPI(None, self.i2c_address)
+                else:
+                    raise ValueError(f"Cannot parse i2c_bus specification: {i2c_bus}")
+            except AttributeError as e:
+                raise Warning("Using i2c_bus as an object")
+                self.i2capi = i2c_bus  #fall back on trying to use the given object as-is
 
         self.streamcount: int = 0
         self.data_read_size: int = 0
@@ -337,74 +346,6 @@ class VL53L5CX:
             buffer[i + 1] = buffer[i + 2]
             buffer[i + 2] = t
 
-    def rd_multi(self, addr: int, buffer: List[int], size: int) -> None:
-        write_addr = self.i2c_msg.write(self.i2c_address, [addr >> 8 & 0xff, addr & 0xff])
-        read_data = self.i2c_msg.read(self.i2c_address, size)
-
-        self._i2c_bus.i2c_rdwr(write_addr, read_data)
-
-        read_size = len(read_data)
-
-        if read_size > 0:
-            read_buffer = list(read_data)
-            buffer[:read_size] = read_buffer[:read_size]
-            if DEBUG_IO:
-                print(f"rd_multi addr={addr:#0{6}x}, len={{}}, size={size}. read_size={read_size}, buf_len= read=[", end="")
-                print_size = read_size
-                if print_size > PRINT_SIZE_MAX:
-                    print_size = PRINT_SIZE_MAX
-                for i in range(print_size):
-                    if i > 0:
-                        print(", ", end="")
-                    print(f"{read_buffer[i]:#0{2}x}", end="")
-                if print_size != read_size:
-                    print(", ...", end="")
-                print("]")
-        else:
-            raise Exception("Couldn't read any bytes")
-
-    def wr_multi(self, addr: int, buffer: List[int], size: int) -> None:
-        position = 0
-        while position < size:
-            data_size = VL53L5CX_COMMS_CHUNK_SIZE - 2 if size - position > VL53L5CX_COMMS_CHUNK_SIZE - 2 else size - position
-
-            buf = [0] * (data_size + 2)
-            buf[0] = addr >> 8
-            buf[1] = addr & 0xff
-            buf[2:] = buffer[position:position + data_size]
-            write = self.i2c_msg.write(self.i2c_address, buf)
-            self._i2c_bus.i2c_rdwr(write)
-
-            if DEBUG_IO:
-                print(f"wr_multi addr={addr:#0{6}x}, len={{}}, size={size}. write_size={data_size} [", end="")
-                print_size = data_size
-                if print_size > PRINT_SIZE_MAX:
-                    print_size = PRINT_SIZE_MAX
-                for i in range(print_size):
-                    if i > 0:
-                        print(", ", end="")
-                    print(f"{buffer[position + i]:#0{2}x}", end="")
-                if print_size != data_size:
-                    print(", ...", end="")
-                print("]")
-            addr += data_size
-            position += data_size
-
-    def rd_byte(self, addr: int) -> int:
-        write_addr = self.i2c_msg.write(self.i2c_address, [addr >> 8 & 0xff, addr & 0xff])
-        read_data = self.i2c_msg.read(self.i2c_address, 1)
-        self._i2c_bus.i2c_rdwr(write_addr, read_data)
-        b = read_data.buf[0][0]
-        if DEBUG_IO:
-            print(f"rd_byte addr={addr:#0{6}x}, byte={b:#0{4}x}")
-        return b
-
-    def wr_byte(self, addr: int, value: int) -> None:
-        write_addr_and_value = self.i2c_msg.write(self.i2c_address, [addr >> 8 & 0xff, addr & 0xff, value])
-        self._i2c_bus.i2c_rdwr(write_addr_and_value)
-        if DEBUG_IO:
-            print(f"wr_byte addr={addr:#0{6}x}, byte={value:#0{4}x}")
-
     @staticmethod
     def wait_ms(ms: int) -> None:
         time.sleep(ms / 1000)
@@ -419,20 +360,24 @@ class VL53L5CX:
 
         timeout = 0
 
-        first = True
-        while first or (self.temp_buffer[pos] & mask) != expected_value:
-            first = False
-            self.rd_multi(address, self.temp_buffer, size)
-            if DEBUG_LOW_LEVEL_LOGIC:
-                print(f"Polling for answer {address:#0{6}x} size={size} pos={pos} mask={mask:#0{4}x} expected_value={expected_value:#0{4}x}\n     result: answer={self.temp_buffer[:size]} (len=)")
-            self.wait_ms(10)
+        if DEBUG_LOW_LEVEL_LOGIC:
+            print(f"Polling for answer {address:#0{6}x} size={size} pos={pos} mask={mask:#0{4}x} expected_value={expected_value:#0{4}x}")
+
+        while True:
+            self.i2capi.rd_multi(address, self.temp_buffer, size)
+            if (self.temp_buffer[pos] & mask) == expected_value: break
 
             if timeout >= 200:  # 2s timeout
+                if DEBUG_LOW_LEVEL_LOGIC:
+                    print(f"failed.: answer={self.temp_buffer[:size]}")
                 raise VL53L5CXException(self.temp_buffer[2])
             elif size >= 4 and self.temp_buffer[2] >= 0x7f:
                 raise VL53L5CXException(VL53L5CX_MCU_ERROR)
             else:
                 timeout += 1
+            self.wait_ms(10)
+        if DEBUG_LOW_LEVEL_LOGIC:
+            print(f"result: answer={self.temp_buffer[:size]}")
 
     def _poll_for_mcu_boot(self) -> None:
         """
@@ -444,9 +389,9 @@ class VL53L5CX:
         timeout = 0
 
         while timeout < 500:
-            go2_status0 = self.rd_byte(0x06)
+            go2_status0 = self.i2capi.rd_byte(0x06)
             if go2_status0 & 0x80 != 0:
-                go2_status1 = self.rd_byte(0x07)
+                go2_status1 = self.i2capi.rd_byte(0x07)
                 status |= go2_status1
                 break
 
@@ -552,7 +497,7 @@ class VL53L5CX:
             self.temp_buffer[k] = self.temp_buffer[k + 8]
 
         self.temp_buffer[0x1E0: 0x1E0 + 8] = footer[:]
-        self.wr_multi(0x2e18, self.temp_buffer, VL53L5CX_OFFSET_BUFFER_SIZE)
+        self.i2capi.wr_multi(0x2e18, self.temp_buffer, VL53L5CX_OFFSET_BUFFER_SIZE)
         self._poll_for_answer(4, 1, VL53L5CX_UI_CMD_STATUS, 0xff, 0x03)
 
     def _send_xtalk_data(self, resolution: int) -> None:
@@ -592,14 +537,14 @@ class VL53L5CX:
             self.temp_buffer[0x134:0x134 + len(profile_4x4)] = profile_4x4[:]
             self.temp_buffer[0x078:0x078 + 4] = [0] * 4
 
-        self.wr_multi(0x2cf8, self.temp_buffer, VL53L5CX_XTALK_BUFFER_SIZE)
+        self.i2capi.wr_multi(0x2cf8, self.temp_buffer, VL53L5CX_XTALK_BUFFER_SIZE)
         self._poll_for_answer(4, 1, VL53L5CX_UI_CMD_STATUS, 0xff, 0x03)
 
     def is_alive(self) -> bool:
-        self.wr_byte(0x7fff, 0x00)
-        device_id = self.rd_byte(0)
-        revision_id = self.rd_byte(1)
-        self.wr_byte(0x7fff, 0x02)
+        self.i2capi.wr_byte(0x7fff, 0x00)
+        device_id = self.i2capi.rd_byte(0)
+        revision_id = self.i2capi.rd_byte(1)
+        self.i2capi.wr_byte(0x7fff, 0x02)
 
         return device_id == 0xF0 and revision_id == 0x02
 
@@ -612,111 +557,117 @@ class VL53L5CX:
         self.default_configuration = self.buffers.VL53L5CX_DEFAULT_CONFIGURATION
 
         # reboot sequence
-        self.wr_byte(0x7fff, 0x00)
-        self.wr_byte(0x0009, 0x04)
-        self.wr_byte(0x000F, 0x40)
-        self.wr_byte(0x000A, 0x03)
-        # tmp = self.rd_byte(0x7FFF)
-        self.rd_byte(0x7FFF)
-        self.wr_byte(0x000C, 0x01)
+        self.i2capi.wr_byte(0x7fff, 0x00)
+        self.i2capi.wr_byte(0x0009, 0x04)
+        self.i2capi.wr_byte(0x000F, 0x40)
+        self.i2capi.wr_byte(0x000A, 0x03)
+        # tmp = self.i2capi.rd_byte(0x7FFF)
+        self.i2capi.rd_byte(0x7FFF)
+        self.i2capi.wr_byte(0x000C, 0x01)
 
-        self.wr_byte(0x0101, 0x00)
-        self.wr_byte(0x0102, 0x00)
-        self.wr_byte(0x010A, 0x01)
-        self.wr_byte(0x4002, 0x01)
-        self.wr_byte(0x4002, 0x00)
-        self.wr_byte(0x010A, 0x03)
-        self.wr_byte(0x0103, 0x01)
-        self.wr_byte(0x000C, 0x00)
-        self.wr_byte(0x000F, 0x43)
+        self.i2capi.wr_byte(0x0101, 0x00)
+        self.i2capi.wr_byte(0x0102, 0x00)
+        self.i2capi.wr_byte(0x010A, 0x01)
+        self.i2capi.wr_byte(0x4002, 0x01)
+        self.i2capi.wr_byte(0x4002, 0x00)
+        self.i2capi.wr_byte(0x010A, 0x03)
+        self.i2capi.wr_byte(0x0103, 0x01)
+        self.i2capi.wr_byte(0x000C, 0x00)
+        self.i2capi.wr_byte(0x000F, 0x43)
         self.wait_ms(1)
 
-        self.wr_byte(0x000F, 0x40)
-        self.wr_byte(0x000A, 0x01)
+        self.i2capi.wr_byte(0x000F, 0x40)
+        self.i2capi.wr_byte(0x000A, 0x01)
         self.wait_ms(100)
 
         # Wait for sensor booted (several ms required to get sensor ready )
-        self.wr_byte(0x7fff, 0x00)
+        self.i2capi.wr_byte(0x7fff, 0x00)
         self._poll_for_answer(1, 0, 0x06, 0xff, 1)
 
-        self.wr_byte(0x000E, 0x01)
-        self.wr_byte(0x7fff, 0x02)
+        self.i2capi.wr_byte(0x000E, 0x01)
+        self.i2capi.wr_byte(0x7fff, 0x02)
 
         # Enable FW access
-        self.wr_byte(0x03, 0x0D)
-        self.wr_byte(0x7fff, 0x01)
+        self.i2capi.wr_byte(0x03, 0x0D)
+        self.i2capi.wr_byte(0x7fff, 0x01)
         self._poll_for_answer(1, 0, 0x21, 0x10, 0x10)
-        self.wr_byte(0x7fff, 0x00)
+        self.i2capi.wr_byte(0x7fff, 0x00)
 
         # Enable host access to GO1
-        # tmp = self.rd_byte(0x7fff)
-        # self.rd_byte(0x7fff)
-        self.wr_byte(0x0C, 0x01)
+        # tmp = self.i2capi.rd_byte(0x7fff)
+        # self.i2capi.rd_byte(0x7fff)
+        self.i2capi.wr_byte(0x0C, 0x01)
 
         # Power ON status
-        self.wr_byte(0x7fff, 0x00)
-        self.wr_byte(0x101, 0x00)
-        self.wr_byte(0x102, 0x00)
-        self.wr_byte(0x010A, 0x01)
-        self.wr_byte(0x4002, 0x01)
-        self.wr_byte(0x4002, 0x00)
-        self.wr_byte(0x010A, 0x03)
-        self.wr_byte(0x103, 0x01)
-        self.wr_byte(0x400F, 0x00)
-        self.wr_byte(0x21A, 0x43)
-        self.wr_byte(0x21A, 0x03)
-        self.wr_byte(0x21A, 0x01)
-        self.wr_byte(0x21A, 0x00)
-        self.wr_byte(0x219, 0x00)
-        self.wr_byte(0x21B, 0x00)
+        self.i2capi.wr_byte(0x7fff, 0x00)
+        self.i2capi.wr_byte(0x101, 0x00)
+        self.i2capi.wr_byte(0x102, 0x00)
+        self.i2capi.wr_byte(0x010A, 0x01)
+        self.i2capi.wr_byte(0x4002, 0x01)
+        self.i2capi.wr_byte(0x4002, 0x00)
+        self.i2capi.wr_byte(0x010A, 0x03)
+        self.i2capi.wr_byte(0x103, 0x01)
+        self.i2capi.wr_byte(0x400F, 0x00)
+        self.i2capi.wr_byte(0x21A, 0x43)
+        self.i2capi.wr_byte(0x21A, 0x03)
+        self.i2capi.wr_byte(0x21A, 0x01)
+        self.i2capi.wr_byte(0x21A, 0x00)
+        self.i2capi.wr_byte(0x219, 0x00)
+        self.i2capi.wr_byte(0x21B, 0x00)
 
         # Wake up MCU
-        self.wr_byte(0x7fff, 0x00)
-        # tmp = self.rd_byte(0x7fff)
-        # self.rd_byte(0x7fff)
-        self.wr_byte(0x0C, 0x00)
-        self.wr_byte(0x7fff, 0x01)
-        self.wr_byte(0x20, 0x07)
-        self.wr_byte(0x20, 0x06)
+        self.i2capi.wr_byte(0x7fff, 0x00)
+        # tmp = self.i2capi.rd_byte(0x7fff)
+        # self.i2capi.rd_byte(0x7fff)
+        self.i2capi.wr_byte(0x0C, 0x00)
+        self.i2capi.wr_byte(0x7fff, 0x01)
+        self.i2capi.wr_byte(0x20, 0x07)
+        self.i2capi.wr_byte(0x20, 0x06)
 
         # Download FW into VL53L5
-        self.wr_byte(0x7fff, 0x09)
-        self.wr_multi(0, self.buffers.VL53L5CX_FIRMWARE[0:0x8000], 0x8000)
-        self.wr_byte(0x7fff, 0x0a)
-        self.wr_multi(0, self.buffers.VL53L5CX_FIRMWARE[0x8000:0x10000], 0x8000)
-        self.wr_byte(0x7fff, 0x0b)
-        self.wr_multi(0, self.buffers.VL53L5CX_FIRMWARE[0x10000:0x15000], 0x5000)
-        self.wr_byte(0x7fff, 0x01)
+        if DEBUG_INITIALIZATION: print("init: downloading FW...")
+        self.i2capi.wr_byte(0x7fff, 0x09)
+        self.i2capi.wr_multi(0, self.buffers.VL53L5CX_FIRMWARE[0:0x8000], 0x8000)
+        self.i2capi.wr_byte(0x7fff, 0x0a)
+        self.i2capi.wr_multi(0, self.buffers.VL53L5CX_FIRMWARE[0x8000:0x10000], 0x8000)
+        self.i2capi.wr_byte(0x7fff, 0x0b)
+        self.i2capi.wr_multi(0, self.buffers.VL53L5CX_FIRMWARE[0x10000:0x15000], 0x5000)
+        self.i2capi.wr_byte(0x7fff, 0x01)
 
         # Check if FW correctly downloaded
-        self.wr_byte(0x7fff, 0x02)
-        self.wr_byte(0x03, 0x0D)
-        self.wr_byte(0x7fff, 0x01)
+        if DEBUG_INITIALIZATION: print("init: checking FW...")
+        self.i2capi.wr_byte(0x7fff, 0x02)
+        self.i2capi.wr_byte(0x03, 0x0D)
+        self.i2capi.wr_byte(0x7fff, 0x01)
         self._poll_for_answer(1, 0, 0x21, 0x10, 0x10)
-        # self.wr_byte(0x7fff, 0x00)
-        # tmp = self.rd_byte(0x7fff)
-        self.wr_byte(0x7fff, 0x00)
-        self.wr_byte(0x0C, 0x01)
+        
+        
+        self.i2capi.wr_byte(0x7fff, 0x00)
+        tmp = self.i2capi.rd_byte(0x7fff)
+        #self.i2capi.wr_byte(0x7fff, 0x00)
+        self.i2capi.wr_byte(0x0C, 0x01)
 
         # Reset MCU and wait boot
-        self.wr_byte(0x7FFF, 0x00)
-        self.wr_byte(0x114, 0x00)
-        self.wr_byte(0x115, 0x00)
-        self.wr_byte(0x116, 0x42)
-        self.wr_byte(0x117, 0x00)
-        self.wr_byte(0x0B, 0x00)
-        # tmp = self.rd_byte(0x7fff)
-        # self.rd_byte(0x7fff)
-        self.wr_byte(0x0C, 0x00)
-        self.wr_byte(0x0B, 0x01)
-        self._poll_for_answer(1, 0, 0x06, 0xff, 0x00)
-        # self._poll_for_mcu_boot()
-        self.wr_byte(0x7fff, 0x02)
+        if DEBUG_INITIALIZATION: print("init: resetting MCU")        
+        self.i2capi.wr_byte(0x7FFF, 0x00)
+        self.i2capi.wr_byte(0x114, 0x00)
+        self.i2capi.wr_byte(0x115, 0x00)
+        self.i2capi.wr_byte(0x116, 0x42)
+        self.i2capi.wr_byte(0x117, 0x00)
+        self.i2capi.wr_byte(0x0B, 0x00)
+        tmp = self.i2capi.rd_byte(0x7fff)
+        # self.i2capi.rd_byte(0x7fff)
+        self.i2capi.wr_byte(0x0C, 0x00)
+        self.i2capi.wr_byte(0x0B, 0x01)
+        #self._poll_for_answer(1, 0, 0x06, 0xff, 0x00)
+        self._poll_for_mcu_boot()
+        
+        self.i2capi.wr_byte(0x7fff, 0x02)
 
         # Get offset NVM data and store them into the offset buffer
-        self.wr_multi(0x2fd8, self.buffers.VL53L5CX_GET_NVM_CMD, len(self.buffers.VL53L5CX_GET_NVM_CMD))
+        self.i2capi.wr_multi(0x2fd8, self.buffers.VL53L5CX_GET_NVM_CMD, len(self.buffers.VL53L5CX_GET_NVM_CMD))
         self._poll_for_answer(4, 0, VL53L5CX_UI_CMD_STATUS, 0xff, 2)
-        self.rd_multi(VL53L5CX_UI_CMD_START, self.temp_buffer, VL53L5CX_NVM_DATA_SIZE)
+        self.i2capi.rd_multi(VL53L5CX_UI_CMD_START, self.temp_buffer, VL53L5CX_NVM_DATA_SIZE)
         self.offset_data[:VL53L5CX_OFFSET_BUFFER_SIZE] = self.temp_buffer[:VL53L5CX_OFFSET_BUFFER_SIZE]
         self._send_offset_data(VL53L5CX_RESOLUTION_4X4)
 
@@ -725,7 +676,7 @@ class VL53L5CX:
         self._send_xtalk_data(VL53L5CX_RESOLUTION_4X4)
 
         # Send default configuration to VL53L5CX firmware
-        self.wr_multi(0x2c34,
+        self.i2capi.wr_multi(0x2c34,
                       self.default_configuration,
                       len(self.buffers.VL53L5CX_DEFAULT_CONFIGURATION))
         self._poll_for_answer(4, 1, VL53L5CX_UI_CMD_STATUS, 0xff, 0x03)
@@ -739,15 +690,15 @@ class VL53L5CX:
         self.dci_write_data(single_range, VL53L5CX_DCI_SINGLE_RANGE, len(single_range))
 
     def set_i2c_address(self, i2c_address: int) -> None:
-        self.wr_byte(0x7fff, 0x00)
-        self.wr_byte(0x4, i2c_address)
+        self.i2capi.wr_byte(0x7fff, 0x00)
+        self.i2capi.wr_byte(0x4, i2c_address)
         self.i2c_address = i2c_address
-        self.wr_byte(0x7fff, 0x02)
+        self.i2capi.wr_byte(0x7fff, 0x02)
 
     def get_power_mode(self) -> int:
 
-        self.wr_byte(0x7FFF, 0x00)
-        tmp = self.rd_byte(0x009)
+        self.i2capi.wr_byte(0x7FFF, 0x00)
+        tmp = self.i2capi.rd_byte(0x009)
 
         if tmp == 0x4:
             p_power_mode = VL53L5CX_POWER_MODE_WAKEUP
@@ -756,7 +707,7 @@ class VL53L5CX:
         else:
             raise VL53L5CXException(VL53L5CX_STATUS_ERROR)
 
-        self.wr_byte(0x7FFF, 0x02)
+        self.i2capi.wr_byte(0x7FFF, 0x02)
 
         return p_power_mode
 
@@ -764,17 +715,17 @@ class VL53L5CX:
         current_power_mode = self.get_power_mode()
         if power_mode != current_power_mode:
             if power_mode == VL53L5CX_POWER_MODE_WAKEUP:
-                self.wr_byte(0x7FFF, 0x00)
-                self.wr_byte(0x09, 0x04)
+                self.i2capi.wr_byte(0x7FFF, 0x00)
+                self.i2capi.wr_byte(0x09, 0x04)
                 self._poll_for_answer(1, 0, 0x06, 0x01, 1)
             elif power_mode == VL53L5CX_POWER_MODE_SLEEP:
-                self.wr_byte(0x7FFF, 0x00)
-                self.wr_byte(0x09, 0x02)
+                self.i2capi.wr_byte(0x7FFF, 0x00)
+                self.i2capi.wr_byte(0x09, 0x02)
                 self._poll_for_answer(1, 0, 0x06, 0x01, 0)
             else:
                 raise VL53L5CXException(VL53L5CX_STATUS_ERROR)
 
-            self.wr_byte(0x7FFF, 0x02)
+            self.i2capi.wr_byte(0x7FFF, 0x02)
 
     def start_ranging(self) -> None:
         header_config = [0, 0]
@@ -888,12 +839,12 @@ class VL53L5CX:
         self.dci_write_data(output_bh_enable_bytes, VL53L5CX_DCI_OUTPUT_ENABLES, len(output_bh_enable_bytes))
 
         # Start xshut bypass (interrupt mode)
-        self.wr_byte(0x7fff, 0x00)
-        self.wr_byte(0x09, 0x05)
-        self.wr_byte(0x7fff, 0x02)
+        self.i2capi.wr_byte(0x7fff, 0x00)
+        self.i2capi.wr_byte(0x09, 0x05)
+        self.i2capi.wr_byte(0x7fff, 0x02)
 
         # Start ranging session
-        self.wr_multi(VL53L5CX_UI_CMD_END - (4 - 1), cmd, len(cmd))
+        self.i2capi.wr_multi(VL53L5CX_UI_CMD_END - (4 - 1), cmd, len(cmd))
         self._poll_for_answer(4, 1, VL53L5CX_UI_CMD_STATUS, 0xff, 0x03)
 
         # Read ui range data content and compare if data size is the correct one
@@ -910,21 +861,21 @@ class VL53L5CX:
         timeout = 0
         buf = [0, 0, 0, 0]
 
-        self.rd_multi(0x2FFC, buf, 4)
+        self.i2capi.rd_multi(0x2FFC, buf, 4)
         auto_stop_flag = buf[0] + buf[1] * 0x100 + buf[2] * 0x10000 + buf[3] * 0x1000000
 
         if auto_stop_flag != 0x4FF:
-            self.wr_byte(0x7fff, 0x00)
+            self.i2capi.wr_byte(0x7fff, 0x00)
 
             # Provoke MCU stop
-            self.wr_byte(0x15, 0x16)
-            self.wr_byte(0x14, 0x01)
+            self.i2capi.wr_byte(0x15, 0x16)
+            self.i2capi.wr_byte(0x14, 0x01)
 
             # Poll for G02 status 0 MCU stop
             tmp = 0
 
             while ((tmp & 0x80) >> 7) == 0x00:
-                tmp = self.rd_byte(0x6)
+                tmp = self.i2capi.rd_byte(0x6)
                 self.wait_ms(10)
                 timeout += 1  # Timeout reached after 5 seconds
 
@@ -932,23 +883,23 @@ class VL53L5CX:
                     raise VL53L5CXException(tmp)
 
         # Check GO2 status 1 if status is still OK
-        tmp = self.rd_byte(0x6)
+        tmp = self.i2capi.rd_byte(0x6)
         if tmp & 0x80 != 0:
-            tmp = self.rd_byte(0x7)
+            tmp = self.i2capi.rd_byte(0x7)
             if tmp != 0x84 and tmp != 0x85:
                 raise VL53L5CXException(tmp)
 
         # Undo MCU stop
-        self.wr_byte(0x7fff, 0x00)
-        self.wr_byte(0x14, 0x00)
-        self.wr_byte(0x15, 0x00)
+        self.i2capi.wr_byte(0x7fff, 0x00)
+        self.i2capi.wr_byte(0x14, 0x00)
+        self.i2capi.wr_byte(0x15, 0x00)
 
         # Stop xshut bypass
-        self.wr_byte(0x09, 0x04)
-        self.wr_byte(0x7fff, 0x02)
+        self.i2capi.wr_byte(0x09, 0x04)
+        self.i2capi.wr_byte(0x7fff, 0x02)
 
     def check_data_ready(self) -> bool:
-        self.rd_multi(0x0, self.temp_buffer, 4)
+        self.i2capi.rd_multi(0x0, self.temp_buffer, 4)
 
         if ((self.temp_buffer[0] != self.streamcount)
                 and (self.temp_buffer[0] != 255)
@@ -971,7 +922,7 @@ class VL53L5CX:
 
         if DEBUG_LOW_LEVEL_LOGIC_GET_RANGING_DATA:
             print(f"vl53l5cx_get_ranging_data: data_read_size={self.data_read_size}")
-        self.rd_multi(0x0, self.temp_buffer, self.data_read_size)
+        self.i2capi.rd_multi(0x0, self.temp_buffer, self.data_read_size)
         self.streamcount = self.temp_buffer[0]
         self.swap_buffer(self.temp_buffer, self.data_read_size)
         if DEBUG_LOW_LEVEL_LOGIC_GET_RANGING_DATA:
@@ -1175,11 +1126,11 @@ class VL53L5CX:
             cmd[3] = ((data_size & 0xf) << 4) & 0xff
 
             # Request data reading from FW
-            self.wr_multi(VL53L5CX_UI_CMD_END - 11, cmd, len(cmd))
+            self.i2capi.wr_multi(VL53L5CX_UI_CMD_END - 11, cmd, len(cmd))
             self._poll_for_answer(4, 1, VL53L5CX_UI_CMD_STATUS, 0xff, 0x03)
 
             # Read new data sent (4 bytes header + data_size + 8 bytes footer)
-            self.rd_multi(VL53L5CX_UI_CMD_START, self.temp_buffer, rd_size)
+            self.i2capi.rd_multi(VL53L5CX_UI_CMD_START, self.temp_buffer, rd_size)
             self.swap_buffer(self.temp_buffer, data_size + 12)
 
             # Copy data from FW into input structure (-4 bytes to remove header)
@@ -1218,7 +1169,7 @@ class VL53L5CX:
             self.temp_buffer[data_size + 4: data_size + 4 + len(footer)] = footer[:]
 
             # Send data to FW
-            self.wr_multi(address, self.temp_buffer, data_size + 12)
+            self.i2capi.wr_multi(address, self.temp_buffer, data_size + 12)
             self._poll_for_answer(4, 1, VL53L5CX_UI_CMD_STATUS, 0xff, 0x03)
 
             self.swap_buffer(data, data_size)
