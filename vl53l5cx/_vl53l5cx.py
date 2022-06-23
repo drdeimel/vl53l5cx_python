@@ -1,8 +1,8 @@
 import time
 
 from typing import List
-from .api import *
-from .buffers import Buffers
+from ._api import *
+from ._buffers import Buffers
 
 DEBUG_INITIALIZATION = False
 DEBUG_LOW_LEVEL_LOGIC = False
