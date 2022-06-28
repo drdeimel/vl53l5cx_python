@@ -243,8 +243,8 @@ class VL53L5CX:
                                           + self.L5CX_SIGR_SIZE + self.L5CX_DIST_SIZE + self.L5CX_RFLEST_SIZE + self.L5CX_STA_SIZE
                                           + self.L5CX_MOT_SIZE + 8)
 
-        if self.VL53L5CX_MAX_RESULTS_SIZE < 1024:
-            self.VL53L5CX_TEMPORARY_BUFFER_SIZE = 1024
+        if self.VL53L5CX_MAX_RESULTS_SIZE < 2048:
+            self.VL53L5CX_TEMPORARY_BUFFER_SIZE = 2048
         else:
             self.VL53L5CX_TEMPORARY_BUFFER_SIZE = self.VL53L5CX_MAX_RESULTS_SIZE
 
