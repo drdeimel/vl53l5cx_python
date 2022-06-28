@@ -12,7 +12,7 @@ class I2CAPI:
     """
     Implementation to read/write via PYFTDI
     """
-    def __init__(self, i2c_bus, bus_id, frequency=1000000):
+    def __init__(self, i2c_bus, bus_id, frequency=400000):
         if i2c_bus is None:
             raise ValueError("You need to specify the FTDI URL as i2c_bus argument")
         import pyftdi as pyftdi
